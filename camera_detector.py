@@ -16,6 +16,8 @@ from shared_models import shared_models
 import torch.nn.functional as F
 import threading
 import gc
+from scipy.spatial import KDTree
+import time
 def list_cameras():
         """列出所有連接的 RealSense 相機"""
         ctx = rs.context()
@@ -82,8 +84,8 @@ class CameraDetector:
 
         # 初始化相機
         self.init_camera()
-        
-        print(f"\n✅ 相機 {camera_id} (序列號: {realsense_serial}) 初始化完成")
+        self.camera_started = True
+        print(f"\n✅ 相機 {self.camera_id} (序列號: {self.camera_serial}) 初始化完成")
 
     def init_camera(self):
         """初始化 RealSense 相機"""
@@ -102,13 +104,207 @@ class CameraDetector:
         ).as_video_stream_profile().get_intrinsics()
         
         print(f"  相機內參: fx={self.intrinsics.fx:.1f}, fy={self.intrinsics.fy:.1f}")
-        
+        print(f"  預熱中...")
         # 跳過前 40 幀
         for i in range(40):
             self.pipeline.wait_for_frames()
+       
+    def pause_camera(self):
+        """暫停相機（臨時停止但保留設定）"""
+        if not self.camera_started:
+            return
+        
+        print(f"[Camera {self.camera_id}] ⏸️  暫停相機...")
+        
+        if self.pipeline:
+            self.pipeline.stop()
+        
+        self.camera_started = False
+        print(f"  ✅ 相機已暫停")
+    def resume_camera(self):
+        """恢復相機（快速重啟）"""
+        if self.camera_started:
+            print(f"[Camera {self.camera_id}] 相機已在運行")
+            return
+        
+        print(f"[Camera {self.camera_id}] ▶️  恢復相機...")
+        
+        # 重新啟動（保留之前的配置）
+        config = rs.config()
+        config.enable_device(self.camera_serial)
+        config.enable_stream(rs.stream.depth, 1280, 720, rs.format.z16, 30)
+        config.enable_stream(rs.stream.color, 1280, 720, rs.format.bgr8, 30)
+        
+        self.profile = self.pipeline.start(config)
+        self.align = rs.align(rs.stream.color)
+        
+        # 快速預熱（只需 10 幀）
+        for i in range(10):
+            self.pipeline.wait_for_frames()
+        
+        self.camera_started = True
+        print(f"  ✅ 相機已恢復")
+    def test_buffer_without_reading(self):
+        """測試完全不讀取時的緩衝區積累"""
+        if not self.camera_started:
+            print("❌ 相機未啟動")
+            return
+        
+        print(f"\n{'='*60}")
+        print(f"[測試] 相機 {self.camera_id} - 完全不讀取測試")
+        print(f"{'='*60}")
+        
+        # 步驟 1：清空
+        print("步驟 1: 清空所有現有幀...")
+        count_before = 0
+        while True:
+            frames = self.pipeline.poll_for_frames()
+            if frames:
+                count_before += 1
+            else:
+                break
+        print(f"  清空了 {count_before} 幀")
+        
+        # 步驟 2：完全不讀取，等待 5 秒
+        print("步驟 2: 完全不讀取，等待 5 秒...")
+        print("  （如果有其他線程在讀取，緩衝區不會積累）")
+        
+        start_time = time.time()
+        time.sleep(5.0)
+        elapsed = time.time() - start_time
+        
+        print(f"  實際等待時間: {elapsed:.3f}s")
+        
+        # 步驟 3：立即計數緩衝區
+        print("步驟 3: 計數緩衝區中的幀...")
+        
+        count_after = 0
+        timestamps = []
+        
+        for i in range(300):  # 最多檢查 300 幀
+            frames = self.pipeline.poll_for_frames()
+            if frames:
+                count_after += 1
+                ts = frames.get_timestamp()
+                timestamps.append(ts)
+                
+                # 只打印前 5 幀和最後 5 幀
+                if count_after <= 5 or i >= 295:
+                    print(f"  幀 {count_after}: timestamp={ts:.2f}ms")
+            else:
+                break
+        
+        # 結果分析
+        print(f"\n{'='*60}")
+        print("測試結果:")
+        print(f"  等待時間: {elapsed:.1f}s")
+        print(f"  緩衝區幀數: {count_after}")
+        print(f"  理論值 (30 FPS × 5s): 150 幀")
+        print(f"  實際比例: {count_after/150*100:.0f}%")
+        
+        if count_after < 5:
+            print(f"\n  ❌ 嚴重問題：幾乎沒有幀積累！")
+            print(f"     可能原因：")
+            print(f"     1. 有後台線程在持續讀取相機")
+            print(f"     2. 有其他程序在訪問相機")
+            print(f"     3. 相機沒有正常串流")
+        elif count_after < 100:
+            print(f"\n  ⚠️ 幀積累不足（可能有程序在讀取）")
+        else:
+            print(f"\n  ✅ 緩衝區積累正常（沒有其他程序干擾）")
+        
+        # 時間戳分析
+        if len(timestamps) > 1:
+            time_span = (timestamps[-1] - timestamps[0]) / 1000.0  # 秒
+            print(f"\n  幀時間跨度: {time_span:.2f}s")
+            
+            if time_span < 1.0:
+                print(f"  ⚠️ 時間跨度太小！這些可能是舊幀")
+        
+        print(f"{'='*60}\n")
+        
+        return count_after
     
+
+    
+    def check_for_background_threads(self):
+        """檢查是否有後台線程在讀取相機"""
+        import threading
+        
+        print(f"\n{'='*60}")
+        print(f"[診斷] 檢查相機 {self.camera_id} 的後台線程")
+        print(f"{'='*60}")
+        
+        # 列出所有活動線程
+        all_threads = threading.enumerate()
+        print(f"當前活動線程數: {len(all_threads)}")
+        
+        for thread in all_threads:
+            print(f"  - {thread.name} (daemon={thread.daemon}, alive={thread.is_alive()})")
+        
+        # 檢查類成員變量
+        print(f"\n檢查相機 {self.camera_id} 的成員變量:")
+        
+        if hasattr(self, 'camera_thread'):
+            print(f"  ⚠️ 發現 camera_thread: {self.camera_thread}")
+            if self.camera_thread:
+                print(f"     - Alive: {self.camera_thread.is_alive()}")
+        else:
+            print(f"  ✅ 無 camera_thread")
+        
+        if hasattr(self, 'thread_running'):
+            print(f"  ⚠️ 發現 thread_running: {self.thread_running}")
+        else:
+            print(f"  ✅ 無 thread_running")
+        
+        if hasattr(self, 'running'):
+            print(f"  發現 running: {self.running}")
+        
+        print(f"{'='*60}\n")
+
+        
+
+    
+
     def get_current_frame(self):
-        """獲取當前幀"""
+        # self.check_for_background_threads()
+        # self.test_buffer_without_reading()
+        """
+        獲取當前幀（適配 RealSense 小隊列設計）
+        
+        RealSense 特性：
+        - 隊列只保留 1-2 幀（不積累）
+        - 這是設計特性，不是 bug
+        - 必須用 wait_for_frames() 主動等待新幀
+        """
+        if not self.camera_started:
+            print(f"[Camera {self.camera_id}] ❌ 相機未啟動")
+            return None, None
+        
+        print(f"[Camera {self.camera_id}] 獲取最新幀...")
+        
+        # ========== 步驟 1：清空隊列（只有 1-2 幀）==========
+        flush_count = 0
+        while self.pipeline.poll_for_frames():
+            flush_count += 1
+        print(f"  Flushed {flush_count} frames")
+        
+        # ========== 步驟 2：主動等待新幀（關鍵！）==========
+        # 不用 sleep 等待積累，而是用 wait 主動獲取新幀
+        print(f"  Waiting for 15 new frames (~0.6s)...")
+        
+        for i in range(15):
+            try:
+                # wait_for_frames() 會阻塞直到相機產生「下一個」新幀
+                frames = self.pipeline.wait_for_frames()
+                
+                # 稍微延遲，讓相機有時間產生下一幀
+                # 30 FPS = 33.33ms/幀，等 40ms 確保是新幀
+                time.sleep(0.040)
+                
+            except Exception as e:
+                print(f"  ⚠️ 等待幀失敗: {e}")
+                break
         frames = self.pipeline.wait_for_frames()
         aligned_frames = self.align.process(frames)
         
@@ -143,7 +339,7 @@ class CameraDetector:
             Z = depth
             
             points_3d.append([X, Y, Z])
-        
+        print(f"最小z: {(min([p[2] for p in points_3d]) if len(points_3d)>0 else 0)}")
         return np.array(points_3d)
     
     def compute_3d_bounding_box(self, points_3d):
@@ -183,11 +379,25 @@ class CameraDetector:
             [max_bound[0], max_bound[1], min_bound[2]],
             [max_bound[0], max_bound[1], max_bound[2]],
         ])
+        
         # 轉回原始坐標系
         corners_world = corners_local @ axes + centroid
+        corners_xy = corners_world[:, :2]  # 只取 X, Y
+        center_xy = np.mean(corners_xy, axis=0)  # (x_center, y_center)
+        kdtree_xy = KDTree(points_3d[:, :2])
+        distances, indices = kdtree_xy.query(center_xy, k=10)  # 找10個最近點
         
+        nearby_points = points_3d[indices]
+        
+        if len(nearby_points) > 0:
+            center_z = np.mean(nearby_points[:, 2])
+        else:
+            center_z = centroid[2]
+        
+        new_center = np.array([center_xy[0], center_xy[1], center_z])
+        print(f"      3D BBox 中心 Z 調整: {centroid[2]:.4f} -> {new_center[2]:.4f} ")
         return {
-            'center': centroid,
+            'center': new_center,
             'size': size,
             'orientation': {'yaw': yaw, 'pitch': pitch},
             'rotation_matrix': axes,
@@ -275,42 +485,46 @@ class CameraDetector:
         
         return keep
     
-    def camera_to_ee_transform(self, point_camera): 
-        horizontal_offset = 29 #mm
-        vertical_offset = 6.4
-        head_offset = 0
-        z_offset = 7.0
+    def camera_to_ee_transform(self, point_camera_mm): 
+        # horizontal_offset = 29 #mm
+        vertical_offset = 57.5 #mm
+        
+        camera_offset_x = 30 #mm
+        z_offset = 72.32 #mm
         if self.camera_id == 0:
             """頭相機座標轉脖子末端座標"""
-            X_camera, Y_camera, Z_camera = point_camera
+            X_camera, Y_camera, Z_camera = point_camera_mm
             # X_ee = Z_camera
             # Y_ee = -X_camera + head_offset
             # Z_ee = -Y_camera
+            # X_ee = Z_camera
+            # Y_ee = Y_camera 
+            # Z_ee = X_camera
             X_ee = Z_camera
-            Y_ee = Y_camera 
-            Z_ee = X_camera
+            Y_ee = -X_camera + camera_offset_x
+            Z_ee = -Y_camera
 
             
 
         elif self.camera_id == 1:
             """左相機座標轉末端座標"""
-            X_camera, Y_camera, Z_camera = point_camera
-            # X_ee = -X_camera + horizontal_offset
-            # Y_ee = -Y_camera + vertical_offset
-            # Z_ee =  Z_camera - z_offset
-            X_ee = Y_camera + horizontal_offset
-            Y_ee = X_camera + vertical_offset
+            X_camera, Y_camera, Z_camera = point_camera_mm
+            X_ee = -X_camera + camera_offset_x
+            Y_ee = -Y_camera + vertical_offset
             Z_ee =  Z_camera - z_offset
+            # X_ee = Y_camera + horizontal_offset
+            # Y_ee = X_camera + vertical_offset
+            # Z_ee =  Z_camera - z_offset
 
         elif self.camera_id == 2:
             """右相機座標轉末端座標"""
-            X_camera, Y_camera, Z_camera = point_camera
-            # X_ee = -X_camera + horizontal_offset
-            # Y_ee = Y_camera + vertical_offset   
-            # Z_ee = Z_camera - z_offset
-            X_ee = Y_camera + horizontal_offset
-            Y_ee = X_camera + vertical_offset
-            Z_ee =  Z_camera - z_offset
+            X_camera, Y_camera, Z_camera = point_camera_mm
+            X_ee = -X_camera + camera_offset_x
+            Y_ee = -Y_camera + vertical_offset
+            Z_ee = Z_camera - z_offset
+            # X_ee = Y_camera + horizontal_offset
+            # Y_ee = X_camera + vertical_offset
+            # Z_ee =  Z_camera - z_offset
         return (X_ee, Y_ee, Z_ee)
     
     
@@ -399,6 +613,7 @@ class CameraDetector:
 
 
     def _get_initial_detections(self, image_source, image):
+        self.caption = " . ".join(self.candidate_phrases)
         """第一步：使用 GroundingDINO 進行初始偵測"""
         boxes, logits, phrases = predict(
             self.gd_model, image, self.caption, 0.20, 0.10, self.device
@@ -457,23 +672,23 @@ class CameraDetector:
         mask_path = os.path.join(self.output_dir, f"mask_object_{det_idx}.jpg")
         cv2.imwrite(mask_path, object_mask)
         
-        points_3d_object = self.depth_to_point_cloud(
+        self.points_3d_object = self.depth_to_point_cloud(
             self.depth_image, object_mask
         )
         
-        if len(points_3d_object) < 10:
+        if len(self.points_3d_object) < 10:
             print(f"      ❌ 物體點雲不足，跳過")
             return None, None, None
         
-        bbox_3d_object = self.compute_3d_bounding_box(points_3d_object)
+        bbox_3d_object = self.compute_3d_bounding_box(self.points_3d_object)
         
         if bbox_3d_object is None:
             print(f"      ❌ 無法計算整體物體 3D bbox，跳過")
             return None, None, None
         
-        print(f"      ✓ 整體物體 3D bbox 計算成功 ({len(points_3d_object)} 個點)")
+        print(f"      ✓ 整體物體 3D bbox 計算成功 ({len(self.points_3d_object)} 個點)")
         
-        return bbox_3d_object, object_mask, points_3d_object, crop_image
+        return bbox_3d_object, object_mask, self.points_3d_object, crop_image
     
     def _detect_handle_region(self, image_source, crop_image, x1, y1, x2, y2, 
                              bbox_3d_object, object_mask, points_3d_object, det_idx):
@@ -720,30 +935,7 @@ class CameraDetector:
     
     def _save_object_info(self, info):
         """第九步：儲存物品資訊"""
-        # obj_info = {
-        #     "name": info['final_label'],
-        #     "region_type": info['region_type'],
-        #     "3d_center_base": tuple(info['3d_info']['center_base']),
-        #     "3d_size": tuple(info['3d_info']['size_3d']),
-        #     "orientation": {
-        #         "yaw": float(info['3d_info']['yaw']),
-        #         "pitch": float(info['3d_info']['pitch']),
-        #         "edge_yaw": float(info['endpoints']['edge_yaw'])
-        #     },
-        #     "volume": float(info['bbox_3d']['volume']),
-        #     "corners_3d": info['bbox_3d']['corners'].tolist(),
-        #     "rotation_matrix": info['bbox_3d']['rotation_matrix'].tolist(),
-        #     "confidence": float(info['logit']),
-        #     "num_points": len(info['points_3d']),
-        #     "left_endpoint_2d": info['endpoints']['left_2d'] if info['endpoints']['left_2d'] else None,
-        #     "right_endpoint_2d": info['endpoints']['right_2d'] if info['endpoints']['right_2d'] else None,
-        #     "left_endpoint_3d": tuple(info['endpoints']['left_3d']),
-        #     "right_endpoint_3d": tuple(info['endpoints']['right_3d']),
-        #     "left_endpoint_base": tuple(info['endpoints']['left_base']),
-        #     "right_endpoint_base": tuple(info['endpoints']['right_base']),
-        #     "edge_length_3d": float(info['endpoints']['distance']),
-        #     "camera_id": self.camera_id
-        # }
+      
         yaw = info['3d_info']['yaw']
         if yaw <0:
             yaw = yaw+180
@@ -757,12 +949,12 @@ class CameraDetector:
             "center_pos": tuple(info['3d_info']['center_base']),
             "3d_size": tuple(info['3d_info']['size_3d']),
             "angle":float(yaw),
-            "left_endpoint_3d": tuple(info['endpoints']['left_3d']),
             "left_endpoint": tuple(info['endpoints']['left_base']),
             "right_endpoint": tuple(info['endpoints']['right_base']),
             "camera_id": self.camera_id,
             "confidence": float(info['logit']),
             "pick_mode":pick_mode,
+            "center_vector": tuple(info.get('center_vector', (None, None, None)))
         }
         
         self.objects_info.append(obj_info)
@@ -771,6 +963,15 @@ class CameraDetector:
     # 主要偵測函數
     # ========================================
     
+
+    def _calculate_unit_vector(self, pointA, pointB):
+        """計算兩點之間的向量"""
+        vector = np.array(pointB) - np.array(pointA)
+        norm = np.linalg.norm(vector)
+        if norm == 0:
+            return vector
+        return vector / norm
+
     def detect_objects(self):
         
         self.handle_reference_features = shared_models.get_handle_features(self.candidate_phrases[0])
@@ -783,7 +984,7 @@ class CameraDetector:
         print(f"\n🔍 相機 {self.camera_id} 開始物品偵測（最多 {self.max_objects} 個物品）...")
         
         # 載入和準備影像
-        temp_image_path = f"/tmp/temp_detect_camera_{self.camera_id}.png"
+        temp_image_path = f"/home/gairobots/camera/GroundingDINO/data/tmp/temp_detect_camera_{self.camera_id}.png"
         cv2.imwrite(temp_image_path, self.latest_color_image)
         image_source, image = load_image(temp_image_path)
         
@@ -853,6 +1054,10 @@ class CameraDetector:
             print(f"      3D中心: ({info_3d['center_base'][0]:.3f}, {info_3d['center_base'][1]:.3f}, {info_3d['center_base'][2]:.3f}) mm")
             print(f"      3D尺寸: ({info_3d['size_3d'][0]:.3f}, {info_3d['size_3d'][1]:.3f}, {info_3d['size_3d'][2]:.3f}) mm")
             
+            total_center = np.mean(bbox_3d_object['corners'], axis=0) * 1000.0 #mm
+            handle_center = info_3d['center_3d'] 
+            center_vector = self._calculate_unit_vector(handle_center, total_center)
+
             # 第六步：計算端點
             endpoints = self._calculate_endpoints(bbox_3d, info_3d['center_3d'])
             
@@ -876,7 +1081,9 @@ class CameraDetector:
                 'region_type': region_type,
                 'final_label': final_label,
                 'logit': logit,
-                'points_3d': points_3d
+                'points_3d': points_3d,
+                'center_vector': center_vector
+
             }
             
             # 第八步：視覺化
@@ -912,9 +1119,10 @@ class CameraDetector:
             return False
             
         print(f"\n🔍 相機 {self.camera_id} 開始物品偵測（簡化版 - 最多 {self.max_objects} 個物品）...")
+        print(f"phase list: {self.candidate_phrases}")
         
         # 載入和準備影像
-        temp_image_path = f"/tmp/temp_detect_camera_{self.camera_id}.png"
+        temp_image_path = f"/home/gairobots/camera/GroundingDINO/data/tmp/temp_detect_camera_{self.camera_id}.png"
         cv2.imwrite(temp_image_path, self.latest_color_image)
         image_source, image = load_image(temp_image_path)
         
@@ -1037,8 +1245,9 @@ class CameraDetector:
             self._save_object_info_simple(detection_info)
         
         # 儲存結果
+        vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
         result_path = os.path.join(self.output_dir, "detection_3d_simple.jpg")
-        cv2.imwrite(result_path, vis)
+        cv2.imwrite(result_path, vis_bgr)
         
         if not any_detected:
             print(f"   ❌ 相機 {self.camera_id}: 未偵測到任何物品")
@@ -1123,10 +1332,11 @@ class CameraDetector:
         yaw = info['3d_info']['yaw']
         if yaw <0:
             yaw = yaw+180
-
-        if info['3d_info']['size_3d'][2]> info['3d_info']['size_3d'][0] and info['3d_info']['size_3d'][2]> info['3d_info']['size_3d'][1]:
+        ## xe>ye and xe>ze
+        if info['3d_info']['size_3d'][0]> info['3d_info']['size_3d'][1] and info['3d_info']['size_3d'][0]> info['3d_info']['size_3d'][2]:
             pick_mode="side"
         else:
+        
             pick_mode="down"   
         """簡化版儲存物品資訊（無握柄資訊）"""
         obj_info = {
@@ -1135,7 +1345,6 @@ class CameraDetector:
             "center_pos": tuple(info['3d_info']['center_base']),
             "3d_size": tuple(info['3d_info']['size_3d']),
             "angle":float(yaw),
-            "left_endpoint_3d": tuple(info['endpoints']['left_3d']),
             "left_endpoint": tuple(info['endpoints']['left_base']),
             "right_endpoint": tuple(info['endpoints']['right_base']),
             "camera_id": self.camera_id,

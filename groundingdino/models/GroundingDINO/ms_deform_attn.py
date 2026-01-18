@@ -27,8 +27,10 @@ from torch.nn.init import constant_, xavier_uniform_
 
 try:
     from groundingdino import _C
+    _C_LOADED = True
 except:
     warnings.warn("Failed to load custom C++ ops. Running on CPU mode Only!")
+    _C_LOADED = False
 
 
 # helpers
@@ -49,6 +51,10 @@ class MultiScaleDeformableAttnFunction(Function):
         attention_weights,
         im2col_step,
     ):
+        if not _C_LOADED:
+            return multi_scale_deformable_attn_pytorch(
+                value, value_spatial_shapes, sampling_locations, attention_weights
+            )
         ctx.im2col_step = im2col_step
         output = _C.ms_deform_attn_forward(
             value,

@@ -56,16 +56,22 @@ class MultiCameraSystem:
         with self.detection_lock:
             """單個相機的偵測執行函數（在線程中執行）"""
             detector = self.detectors[detector_idx]
-            
+            # ========== 步驟 1：暫停其他相機 ==========
+            for i, other_detector in enumerate(self.detectors):
+                if i != detector_idx and other_detector.camera_started:
+                    other_detector.pause_camera()
+            # ========== 步驟 2：等待 USB 穩定 ==========
+            print("步驟 2: 等待 USB 資源穩定（0.5 秒）...")
+            time.sleep(0.5)
             try:
                 
                 # 先清理記憶體
                 gc.collect()
                 torch.cuda.empty_cache()
-
+                
                 # 獲取幀
                 rgb, depth = detector.get_current_frame()
-                
+
                 if rgb is None or depth is None:
                     print(f"⚠️  相機 {detector.camera_id}: 無法獲取幀")
                     return
@@ -85,7 +91,10 @@ class MultiCameraSystem:
                     'timestamp': time.time()
                 }
                 self.info_process(detector_idx)
-
+                """恢復所有相機（拍攝完成後）"""
+                for i, other_detector in enumerate(self.detectors):
+                    if i != detector_idx and other_detector.camera_started==False:
+                        other_detector.resume_camera()
             except Exception as e:
                 print(f"❌ 相機 {detector.camera_id} 偵測出錯: {e}")
                 self.results[detector.camera_id] = {
@@ -97,6 +106,7 @@ class MultiCameraSystem:
                 detector.clear_detection_data() 
                 gc.collect()
                 torch.cuda.empty_cache()
+                
     
     def update_camera_phrases(self, detector_idx, phrases):
         """更新指定相機的候選短語"""
@@ -104,38 +114,14 @@ class MultiCameraSystem:
             detector = self.detectors[detector_idx]
             detector.candidate_phrases = phrases
             num = len(phrases) if phrases is not None else 0
+            print(f"num:{num}  phrases:{phrases}")
             detector.max_objects = num
+            # detector.caption = " . ".join(self.candidate_phrases)
             print(f"✅ 相機 {detector.camera_id} 的候選短語已更新")
         else:
             print(f"❌ 無效的相機索引: {detector_idx}")
 
-    # def run_sequential(self):
-    #     """順序執行所有相機偵測"""
-    #     print("\n[順序模式] 逐台相機偵測\n")
-        
-    #     for i, detector in enumerate(self.detectors):
-    #         print(f"\n{'='*60}")
-    #         print(f"處理相機 {i+1}/{len(self.detectors)}")
-    #         print(f"{'='*60}")
-            
-    #         # 獲取幀
-    #         rgb, depth = detector.get_current_frame()
-            
-    #         if rgb is None or depth is None:
-    #             print(f"⚠️  無法獲取幀，跳過")
-    #             continue
-            
-    #         # 執行偵測
-    #         success = detector.detect_objects()
-            
-    #         # 儲存結果
-    #         self.results[detector.camera_id] = {
-    #             'success': success,
-    #             'objects': detector.get_objects_info()
-    #         }
-        
-    #     # 打印彙總結果
-    #     self.print_summary()
+
     
     def run_parallel(self):
         """並行執行雙手相機偵測"""
