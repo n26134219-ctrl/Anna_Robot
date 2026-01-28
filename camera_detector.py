@@ -489,8 +489,8 @@ class CameraDetector:
         # horizontal_offset = 29 #mm
         vertical_offset = 57.5 #mm
         
-        camera_offset_x = 30 #mm
-        z_offset = 72.32 #mm
+        camera_offset_x = 31 #mm 30
+        z_offset = 87.32 #mm 62.32 72.32
         if self.camera_id == 0:
             """頭相機座標轉脖子末端座標"""
             X_camera, Y_camera, Z_camera = point_camera_mm
@@ -939,7 +939,7 @@ class CameraDetector:
         yaw = info['3d_info']['yaw']
         if yaw <0:
             yaw = yaw+180
-        if info['3d_info']['size_3d'][2]> info['3d_info']['size_3d'][0] and info['3d_info']['size_3d'][2]> info['3d_info']['size_3d'][1]:
+        if info['3d_info']['size_3d'][2] > info['3d_info']['size_3d'][0] and info['3d_info']['size_3d'][2] > info['3d_info']['size_3d'][1]:
             pick_mode="side"
         else:
             pick_mode="down"
@@ -954,7 +954,10 @@ class CameraDetector:
             "camera_id": self.camera_id,
             "confidence": float(info['logit']),
             "pick_mode":pick_mode,
-            "center_vector": tuple(info.get('center_vector', (None, None, None)))
+            "center_vector": tuple(info.get('center_vector', (None, None, None))),
+            "endpoints_total_obj": tuple(info.get('endpoints_total_obj', (None, None, None))),
+            "longest_length": float(info.get('longest_length', None)),
+            "shortest_length": float(info.get('shortest_length', None)),
         }
         
         self.objects_info.append(obj_info)
@@ -1039,7 +1042,7 @@ class CameraDetector:
                 bbox_3d_object, object_mask, points_3d_object, det_idx
             )
             
-            bbox_3d = region_info['bbox_3d']
+            bbox_3d = region_info['bbox_3d'] # 握柄3d bounding box
             final_mask = region_info['mask']
             final_bbox_2d = region_info['bbox_2d']
             points_3d = region_info['points_3d']
@@ -1060,11 +1063,24 @@ class CameraDetector:
 
             # 第六步：計算端點
             endpoints = self._calculate_endpoints(bbox_3d, info_3d['center_3d'])
-            
+            endpoints_total_obj = self._calculate_endpoints(bbox_3d_object, total_center)
+
+            print(f"     整體物體左端點（mm）: （{endpoints_total_obj['left_base'][0]:.3f}, {endpoints_total_obj['left_base'][1]:.3f}, {endpoints_total_obj['left_base'][2]:.3f}）")
+            print(f"     整體物體右端點（mm）: （{endpoints_total_obj['right_base'][0]:.3f}, {endpoints_total_obj['right_base'][1]:.3f}, {endpoints_total_obj['right_base'][2]:.3f}）")            
             print(f"      左端點基座: ({endpoints['left_base'][0]:.3f}, {endpoints['left_base'][1]:.3f}, {endpoints['left_base'][2]:.3f}) mm")
             print(f"      右端點基座: ({endpoints['right_base'][0]:.3f}, {endpoints['right_base'][1]:.3f}, {endpoints['right_base'][2]:.3f}) mm")
-            print(f"      長邊長度: {endpoints['distance']:.3f} m")
             
+            # 將 tuple 轉換為 numpy array 再計算
+            left_array_base = np.array([endpoints_total_obj['left_base'][0], endpoints_total_obj['left_base'][1]])
+            right_array_base = np.array([endpoints_total_obj['right_base'][0], endpoints_total_obj['right_base'][1]])
+            center_array_base = np.array([info_3d['center_base'][0], info_3d['center_base'][1]])
+
+            length1 = np.linalg.norm(left_array_base - center_array_base)
+            length2 = np.linalg.norm(right_array_base - center_array_base)
+            longest_length = max(length1, length2)
+            shortest_length = min(length1, length2)
+            print(f"      物體中心到長邊端點最長距離: {longest_length:.3f} mm")
+            print(f"      物體中心到長邊端點最短距離: {shortest_length:.3f} mm")
             # 第七步：CLIP 驗證
             print(f"      CLIP 驗證...")
             with torch.no_grad():
@@ -1082,7 +1098,10 @@ class CameraDetector:
                 'final_label': final_label,
                 'logit': logit,
                 'points_3d': points_3d,
-                'center_vector': center_vector
+                'center_vector': center_vector,
+                'endpoints_total_obj': endpoints_total_obj,
+                'longest_length': longest_length,
+                'shortest_length': shortest_length,
 
             }
             
@@ -1332,12 +1351,12 @@ class CameraDetector:
         yaw = info['3d_info']['yaw']
         if yaw <0:
             yaw = yaw+180
-        ## xe>ye and xe>ze
-        if info['3d_info']['size_3d'][0]> info['3d_info']['size_3d'][1] and info['3d_info']['size_3d'][0]> info['3d_info']['size_3d'][2]:
+        
+        if info['3d_info']['size_3d'][2] > info['3d_info']['size_3d'][0] and info['3d_info']['size_3d'][2] > info['3d_info']['size_3d'][1]:
             pick_mode="side"
         else:
+            pick_mode="down"
         
-            pick_mode="down"   
         """簡化版儲存物品資訊（無握柄資訊）"""
         obj_info = {
             "name": info['final_label'],

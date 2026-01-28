@@ -68,6 +68,7 @@ cameras_config = [
 # 初始化系統
 system = MultiCameraSystem(cameras_config)
 
+
 ################################## callback functions ##################################
 """語音系統->相機 ：接收辨識物體名稱"""
 def object_command_callback(msg):
