@@ -1,0 +1,10 @@
+python3.10 -m venv speech_env
+pip install numpy
+pip install openwakeword
+pip install pyaudio
+python -c "import openwakeword; openwakeword.utils.download_models()"
+pip install webrtcvad
+pip install edge_tts
+pip install langdetect
+sudo apt update
+sudo apt install ffmpeg -y
