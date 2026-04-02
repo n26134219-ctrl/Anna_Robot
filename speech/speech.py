@@ -41,8 +41,10 @@ DEVICE_RATE = 48000      # 麥克風硬體支援的取樣率
 TARGET_RATE = 16000      # openWakeWord/Whisper 需要的取樣率
 TARGET_CHUNK = 1280      # 80ms @ 16kHz
 DEVICE_CHUNK = int(DEVICE_RATE * 0.08)  # 80ms @ 48kHz = 3840 樣本
-DEVICE_INDEX = 5         # 外接麥克風 index
-DEVICE_CHANNELS = 1      # 2:立體聲
+DEVICE_INDEX = 11         # 外接麥克風 index
+DEVICE_CHANNELS = 1      # 
+# 啟動時自動檢查裝置狀態
+
 print(f"裝置取樣率: {DEVICE_RATE} Hz")
 print(f"目標取樣率: {TARGET_RATE} Hz")
 print(f"裝置區塊大小: {DEVICE_CHUNK} 樣本")
@@ -291,7 +293,7 @@ def record_command():
         # ===== 錄音串流也用 48kHz =====
         record_stream = audio.open(
             format=pyaudio.paInt16,
-            channels=DEVICE_CHANNELS,  # ← 改成 2
+            channels=DEVICE_CHANNELS,  
             rate=DEVICE_RATE,
             input=True,
             input_device_index=DEVICE_INDEX,

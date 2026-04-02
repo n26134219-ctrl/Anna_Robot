@@ -74,18 +74,39 @@ system = MultiCameraSystem(cameras_config)
 def object_command_callback(msg):
     """接收物體名稱指令並更新 shared_object"""
     visual_object_name = msg.data
-
+    print(f"ffff")
     visual_object_name = json.loads(msg.data)  # ["water bottle", "cup"]
     rospy.loginfo(f"收到物體名稱指令: {visual_object_name}")
     system.update_camera_phrases(0, visual_object_name)
     camera_ready_pub.publish("head_ready")
     # head_camera_capture()
+# def assign_object_phase_callback(msg):
+#     """接收物體名稱指令並更新 shared_object"""
+#     print(f"sssss")
+#     visual_object_name = msg.data
+#     rospy.loginfo(f"收到物體名稱指令: {visual_object_name}")
+#     system.update_camera_phrases(0, [visual_object_name])
+#     camera_ready_pub.publish("head_ready")
+
 def assign_object_phase_callback(msg):
-    """接收物體名稱指令並更新 shared_object"""
-    visual_object_name = msg.data
-    rospy.loginfo(f"收到物體名稱指令: {visual_object_name}")
-    system.update_camera_phrases(0, [visual_object_name])
-    camera_ready_pub.publish("head_ready")
+    try:
+        # 1. 解析字串
+        # msg.data 是 '["rice food"]' -> loads 後變成 ["rice food"] (List)
+        visual_object_names = json.loads(msg.data)
+        
+        # 2. 防呆檢查：確保它是 List
+        if isinstance(visual_object_names, str):
+            visual_object_names = [visual_object_names]
+            
+        rospy.loginfo(f"收到物體名稱指令: {visual_object_names}")
+        
+        # 3. 【關鍵修正】直接傳入變數，絕對不要寫成 [visual_object_names]
+        system.update_camera_phrases(0, visual_object_names)
+        
+        camera_ready_pub.publish("head_ready")
+        
+    except Exception as e:
+        rospy.logerr(f"解析失敗: {e}")
     # head_camera_capture()
 """接收轉換後的基座標"""
 def base_callback(msg):
