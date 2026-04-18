@@ -812,7 +812,13 @@ class CameraDetector:
         left_endpoint_3d = np.array([left_endpoint_3d[0]*1000, left_endpoint_3d[1]*1000, left_endpoint_3d[2]*1000])
         right_endpoint_3d = np.array([right_endpoint_3d[0]*1000, right_endpoint_3d[1]*1000, right_endpoint_3d[2]*1000])
 
-
+        # ==========================================
+        # 🌟 關鍵修復：消除 PCA 向量方向隨機性
+        # 在相機座標系中，X 軸是向右的。
+        # 如果目前被判定為 left 的點，其實際 X 座標卻大於 right，就將它們互換
+        # ==========================================
+        if left_endpoint_3d[0] > right_endpoint_3d[0]:
+            left_endpoint_3d, right_endpoint_3d = right_endpoint_3d, left_endpoint_3d
         left_endpoint_base = self.camera_to_ee_transform(left_endpoint_3d)
         right_endpoint_base = self.camera_to_ee_transform(right_endpoint_3d)
         
