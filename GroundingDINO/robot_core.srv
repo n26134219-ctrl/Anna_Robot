@@ -1,0 +1,18 @@
+# === Request (Python 發送給 C++ 的請求) ===
+# 每個物體的唯一 ID (用來對應 shared_object 的 index)
+uint32[] ids
+
+# 相機座標列表 (對應上面的 ids)
+geometry_msgs/Point[] points
+
+---
+
+# === Response (C++ 回傳給 Python 的結果) ===
+# 回傳 ID 以確保順序正確 (通常跟請求的一樣)
+uint32[] ids
+
+# 轉換後的基座標列表
+geometry_msgs/Point[] points
+
+# 是否執行成功
+bool success
