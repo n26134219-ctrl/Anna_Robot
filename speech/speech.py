@@ -13,7 +13,7 @@ import asyncio
 import edge_tts
 from langdetect import detect
 import os
- # server_url：這裡要填接收端的 IP (192.168.2.108)
+ # server_url：這裡要填接收端的 IP (192.168.2.109)
 
 import rospy
 from std_msgs.msg import String
@@ -25,6 +25,7 @@ rospy.init_node('speech_publisher', anonymous=True)   # 初始化 ROS 節點
 pub = rospy.Publisher('visual_object_command', String, queue_size=10)
 task_pub = rospy.Publisher('task_explanation', String, queue_size=10)
 task_type_pub = rospy.Publisher('task_type', String, queue_size=10)
+
 time.sleep(1)
 rospy.loginfo("語音發佈器已啟動")
 
@@ -41,8 +42,8 @@ DEVICE_RATE = 48000      # 麥克風硬體支援的取樣率
 TARGET_RATE = 16000      # openWakeWord/Whisper 需要的取樣率
 TARGET_CHUNK = 1280      # 80ms @ 16kHz
 DEVICE_CHUNK = int(DEVICE_RATE * 0.08)  # 80ms @ 48kHz = 3840 樣本
-DEVICE_INDEX = 11         # 外接麥克風 index
-DEVICE_CHANNELS = 1      # 
+DEVICE_INDEX = 11         # Default (系統預設麥克風)
+DEVICE_CHANNELS = 1       # 單聲道
 # 啟動時自動檢查裝置狀態
 
 print(f"裝置取樣率: {DEVICE_RATE} Hz")
@@ -51,17 +52,55 @@ print(f"裝置區塊大小: {DEVICE_CHUNK} 樣本")
 print(f"目標區塊大小: {TARGET_CHUNK} 樣本\n")
 
 # ============ 全局初始化 ============
-oww_model = Model(wakeword_models=["/home/gairobots/camera/speech/hey_anna.onnx"], inference_framework='onnx')
+# 使用新訓練的 hey_anna_model.onnx (97.67% 準確率)
+# 改用兼容適配層，避免 OpenWakeWord 框架不相容問題
+from hey_anna_inference import HeyAnnaDetector
+threshold = 0.85  # 根據測試調整到 0.85
+try:
+    oww_model = HeyAnnaDetector(
+        model_path="hey_anna_rf_classifier.pkl",
+        scaler_path="hey_anna_scaler.pkl",
+        threshold=0.85  # 根據測試調整到 0.85
+    )
+    print("✅ 使用新訓練的隨機森林模型 (閾值: 0.850)")
+except Exception as e:
+    print(f"⚠️  新模型加載失敗: {e}，嘗試使用備選方案...")
+    # 備選：使用官方模型
+    # oww_model = Model(wakeword_models=["/home/gairobots/camera/speech/hey_anna.onnx"], inference_framework='onnx')
+
 # command_model = WhisperModel("medium", device="cpu", compute_type="int8")
 vad = webrtcvad.Vad(1)
 
 print("正在初始化音訊設備...")
 audio = pyaudio.PyAudio()
 
-# 預熱模型（用 16kHz 數據）
+# === 新增：檢查設備是否存在 ===
+device_count = audio.get_device_count()
+print(f"系統檢測到 {device_count} 個音訊設備")
+
+# 驗證 DEVICE_INDEX 是否有效
+if DEVICE_INDEX >= device_count or DEVICE_INDEX < 0:
+    print(f"⚠️  設備索引 {DEVICE_INDEX} 無效，嘗試自動檢測...")
+    DEVICE_INDEX = -1  # 使用系統預設
+    
+    # 列出可用設備
+    for i in range(device_count):
+        info = audio.get_device_info_by_index(i)
+        if info['maxInputChannels'] > 0:
+            print(f"  [{i}] {info['name']} (輸入通道: {info['maxInputChannels']})")
+else:
+    device_info = audio.get_device_info_by_index(DEVICE_INDEX)
+    print(f"✓ 使用設備 [{DEVICE_INDEX}]: {device_info['name']}")
+    if device_info['maxInputChannels'] == 0:
+        print(f"⚠️  警告：設備 {DEVICE_INDEX} 沒有輸入通道")
+        DEVICE_INDEX = -1
+
+# 預熱模型（填充緩衝區，不調用預測）
 print("預熱模型...")
-dummy_audio = np.zeros(TARGET_CHUNK, dtype=np.int16)
-_ = oww_model.predict(dummy_audio)
+dummy_audio = np.zeros(TARGET_CHUNK * 8, dtype=np.int16)  # 填充 8 個幀 = 640ms
+for i in range(8):
+    _ = oww_model.predict(dummy_audio[i*TARGET_CHUNK:(i+1)*TARGET_CHUNK])
+oww_model.reset()  # 預熱完成後重置
 print("✓ 模型已就緒\n")
 
 
@@ -128,29 +167,6 @@ async def text_to_speech(answer):
 
 
 
-def send_wav_and_get_response(file_path):
-    server_url = "http://192.168.2.108:9000/upload_wav"
-    try:
-        with open(file_path, 'rb') as f:
-            files = {'file': (file_path, f, 'audio/wav')}
-            response = requests.post(server_url, files=files)
-        
-        if response.status_code == 200:
-            result = response.json()
-            print(f"✓ 上傳成功")
-            print(f"辨識結果: {result['user_command']}")
-            print(f"LLM 回覆: {result['response']}")  # 這裡拿到回覆
-            llm_response = result.get('response', '')
-            if llm_response:
-                    asyncio.run(text_to_speech(llm_response))
-            return result
-        else:
-            print(f"✗ 失敗: {response.text}")
-            return None
-    except Exception as e:
-        print(f"✗ 錯誤: {e}")
-        return None
-
 
 
 
@@ -168,17 +184,38 @@ def init_main_stream():
             pass
     
     # 開啟新串流（48kHz）
-    main_stream = audio.open(
-        format=pyaudio.paInt16,
-        channels=DEVICE_CHANNELS,
-        rate=DEVICE_RATE,           # ← 改用 48kHz
-        input=True,
-        input_device_index=DEVICE_INDEX,
-        frames_per_buffer=DEVICE_CHUNK  # ← 改用 3840
-    )
+    try:
+        main_stream = audio.open(
+            format=pyaudio.paInt16,
+            channels=DEVICE_CHANNELS,
+            rate=DEVICE_RATE,           # ← 改用 48kHz
+            input=True,
+            input_device_index=DEVICE_INDEX,
+            frames_per_buffer=DEVICE_CHUNK,  # ← 改用 3840
+            start=False  # 不要立即開始，待驗證後再開
+        )
+        # 立即開始讀取
+        main_stream.start_stream()
+    except Exception as e:
+        print(f"⚠️  無法開啟設備 {DEVICE_INDEX}: {e}")
+        print(f"    嘗試使用系統預設設備...")
+        try:
+            main_stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=DEVICE_CHANNELS,
+                rate=DEVICE_RATE,
+                input=True,
+                input_device_index=-1,  # 系統預設
+                frames_per_buffer=DEVICE_CHUNK,
+                start=False
+            )
+            main_stream.start_stream()
+        except Exception as e2:
+            print(f"✗ 致命錯誤：無法開啟任何音訊設備: {e2}")
+            raise
     
     # 清空初始緩衝區
-    for _ in range(10):
+    for _ in range(20):
         try:
             main_stream.read(DEVICE_CHUNK, exception_on_overflow=False)
         except:
@@ -195,22 +232,34 @@ print("✓ 音訊串流已就緒\n")
 def detect_wake_word():
     """使用 Anna 模型檢測喚醒詞（48kHz → 16kHz）"""
     global main_stream
-    global last_detection_time  # ← 新增：聲明使用全局變數
+    global last_detection_time 
     
     print("等待喚醒詞: 'ANNA'（按 Ctrl+C 退出）...")
     print("（顯示即時檢測分數，用於調試）\n")
     
-    cooldown_period = 2.0
-    frame_count = 0
+    cooldown_period = 0.2
+    
+    # === 新增：暖機設定 ===
+    warmup_frames = 8  # 減少到 8 幀 = 640ms（足夠填充緩衝區）
+    current_frame = 0
+    warmup_complete = False
+    
+    # 強制重置模型狀態，清除之前的記憶
+    try:
+        oww_model.reset()
+    except:
+        pass
     
     while True:
         if exit_flag:
             print("\n检测到退出信号...")
             return False
+            
         try:
             if not main_stream.is_active():
                 print("偵測到串流關閉，重新初始化...")
                 init_main_stream()
+                
             try:
                 data = main_stream.read(DEVICE_CHUNK, exception_on_overflow=False)
                 audio_raw = np.frombuffer(data, dtype=np.int16)
@@ -218,37 +267,62 @@ def detect_wake_word():
                 print("\n捕获到 Ctrl+C，立即退出...")
                 raise  
             
-            
-            # 立體聲 → 單聲道
+            # 立體聲 → 單聲道 (如果需要的話)
             if DEVICE_CHANNELS == 2:
                 audio_48k = audio_raw.reshape(-1, 2).mean(axis=1).astype(np.int16)
             else:
+                # 已經是單聲道
                 audio_48k = audio_raw
             
-            # 重取樣到 16kHz
-            audio_16k = signal.resample(audio_48k, TARGET_CHUNK).astype(np.int16)
+            # === 關鍵修改 1：改用切片降採樣 ===
+            # 因為 48000 / 16000 = 3 (整數)，直接每 3 個樣本取 1 個
+            # 這樣可以完全避免 scipy.signal.resample 帶來的 FFT 爆音雜訊
+            audio_16k = audio_48k[::3]
+            
+            # === 關鍵修改 2：硬體暖機期間，絕對不餵資料給模型 ===
+            current_frame += 1
+            if current_frame <= warmup_frames:
+                # 只印出進度，但不執行 oww_model.predict
+                print(f"[系統暖機中] 正在清除初始雜訊 ({current_frame}/{warmup_frames})...", end='\r', flush=True)
+                continue
+            elif not warmup_complete:
+                warmup_complete = True
+                print(f"\n✓ 預熱完成，開始檢測...                ")
+                continue  # 多讀一幀以完成緩衝
             
             # 用 16kHz 音訊預測
-            prediction = oww_model.predict(audio_16k)
+            # 新推理類返回 (score, detected) 元組，需要轉換為 dict 格式
+            try:
+                score, detected = oww_model.predict_from_array(audio_16k, sr=16000)
+                prediction = {"hey_anna": score}
+            except:
+                # 備選方案：如果使用官方模型
+                prediction = oww_model.predict(audio_16k)
+            
             current_time = time.time()
-            frame_count += 1
             
             for model_name, score in prediction.items():
-                # ===== 改進：顯示冷卻期狀態 =====
-                if score > 0.15:
-                    # 檢查是否在冷卻期
-                    if (current_time - last_detection_time) < cooldown_period:
-                        remaining = cooldown_period - (current_time - last_detection_time)
-                        print(f"[冷卻中 {remaining:.1f}s] 分數: {score:.3f}  ", end='\r')
-                    else:
-                        print(f"[即時分數] {score:.3f} ", end='\r')
-                
-                # ===== 在冷卻期內跳過 =====
+                # 檢查是否在冷卻期
                 if (current_time - last_detection_time) < cooldown_period:
+                    if score > threshold:
+                        remaining = cooldown_period - (current_time - last_detection_time)
+                        print(f"[冷卻中 {remaining:.1f}s] 分數: {score:.3f}  ", end='\r', flush=True)
                     continue
+                else:
+                    # 更詳細的進度顯示
+                    if score > 0.3:  # 顯示任何有意義的分數
+                        status = "●●●" if score > 0.7 else "●●○" if score > 0.5 else "●○○"
+                        print(f"[偵測中] {status} 分數: {score:.3f} ", end='\r', flush=True)
+                    elif score > 0.0:  # 顯示緩衝進度
+                        progress = int(score * 30)
+                        bar = "█" * progress + "░" * (30 - progress)
+                        print(f"[準備中] [{bar}] {int(score*100)}%", end='\r', flush=True)
                 
-                if score > 0.45:
-                    print(f"\n✓ 檢測到 '{model_name}'! (信心度: {score:.2f})")
+                # === 關鍵修改 3：提高自己訓練模型的觸發門檻 ===
+                # 自己訓練的模型通常需要稍微高一點的門檻 (例如 0.80 或 0.85)
+                # 你可以根據實際測試狀況微調這個數值
+                if score > threshold:  # 改低到 0.50 用於測試 
+                    print(f"\n\n✓ 檢測到 '{model_name}'! (信心度: {score:.2f})")
                     
                     # 清空緩衝區
                     for _ in range(10):
@@ -257,10 +331,17 @@ def detect_wake_word():
                         except:
                             break
                     
-                    last_detection_time = current_time  # ← 更新全局冷卻時間
+                    last_detection_time = current_time 
+                    
+                    # 觸發後重置模型內部狀態，避免連續誤觸
+                    try:
+                        oww_model.reset()
+                    except:
+                        pass
+                        
                     return True
+                    
         except KeyboardInterrupt:
-            # 立即退出，不处理
             raise
         except Exception as e:
             if "Stream not open" in str(e):
@@ -268,9 +349,6 @@ def detect_wake_word():
                 init_main_stream()
             else:
                 raise
-
-
-
 def write_wave(path, frames):
     """寫入 WAV 檔案（16kHz）"""
     wf = wave.open(path, 'wb')
@@ -291,14 +369,29 @@ def record_command():
     
     try:
         # ===== 錄音串流也用 48kHz =====
-        record_stream = audio.open(
-            format=pyaudio.paInt16,
-            channels=DEVICE_CHANNELS,  
-            rate=DEVICE_RATE,
-            input=True,
-            input_device_index=DEVICE_INDEX,
-            frames_per_buffer=DEVICE_CHUNK
-        )
+        try:
+            record_stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=DEVICE_CHANNELS,  
+                rate=DEVICE_RATE,
+                input=True,
+                input_device_index=DEVICE_INDEX,
+                frames_per_buffer=DEVICE_CHUNK,
+                start=False
+            )
+            record_stream.start_stream()
+        except Exception as e:
+            print(f"⚠️  無法開啟錄音設備: {e}，使用系統預設...")
+            record_stream = audio.open(
+                format=pyaudio.paInt16,
+                channels=DEVICE_CHANNELS,  
+                rate=DEVICE_RATE,
+                input=True,
+                input_device_index=-1,  # 系統預設
+                frames_per_buffer=DEVICE_CHUNK,
+                start=False
+            )
+            record_stream.start_stream()
 
         
         # 清空初始緩衝區
@@ -323,14 +416,18 @@ def record_command():
                 audio_48k = audio_raw
 
             # ===== 重取樣到 16kHz =====
-            audio_16k = signal.resample(audio_48k, TARGET_CHUNK).astype(np.int16)
+            # 使用切片降採樣而非 scipy.signal.resample，避免 FFT 爆音和 segfault
+            # 48000 / 16000 = 3，所以每 3 個樣本取 1 個
+            audio_16k = audio_48k[::3].astype(np.int16)
 
             frame_16k = audio_16k.tobytes()
             
             # ===== VAD 判斷（用 16kHz 音訊）=====
             # is_speech_frame = vad.is_speech(frame_16k, TARGET_RATE)
             # ===== VAD 判斷（只用前 30ms = 480 樣本）=====
-            vad_chunk = audio_16k[:480].tobytes()  # 取前 480 樣本
+            # 確保 VAD 輸入長度正確（480 樣本 @ 16kHz = 30ms）
+            vad_chunk_samples = min(480, len(audio_16k))  # 最多 480 樣本
+            vad_chunk = audio_16k[:vad_chunk_samples].tobytes()
             try:
                 is_speech_frame = vad.is_speech(vad_chunk, TARGET_RATE)
             except:
@@ -363,6 +460,8 @@ def record_command():
     
     except Exception as e:
         print(f"錄音時發生錯誤: {e}")
+        import traceback
+        traceback.print_exc()
     
     finally:
         # 確保關閉錄音串流
@@ -439,7 +538,8 @@ def send_wav_file(file_path):
     Returns:
         dict: 包含 user_command 和 response 的字典，失敗時返回 None
     """
-    server_url = "http://192.168.2.108:9000/upload_wav"
+    server_url = "http://192.168.2.109:9000/upload_wav"
+    
     
     try:
         # 檢查檔案是否存在
@@ -589,8 +689,6 @@ def main():
                 print("準備下一次喚醒\n")
     except KeyboardInterrupt:
         print("\n\n收到 Ctrl+C 中断...")           
-    except KeyboardInterrupt:
-        print("\n\n收到中斷信號...")
     except Exception as e:
         print(f"\n發生錯誤: {e}")
         import traceback
@@ -606,4 +704,3 @@ if __name__ == "__main__":
         main()
     except rospy.ROSInterruptException:
         rospy.loginfo("語音發佈器已關閉")
-    main()
