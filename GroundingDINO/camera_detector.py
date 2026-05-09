@@ -342,6 +342,84 @@ class CameraDetector:
         print(f"最小z: {(min([p[2] for p in points_3d]) if len(points_3d)>0 else 0)}")
         return np.array(points_3d)
     
+
+    def _save_pca_point_cloud_vis(self, points_3d, bbox_3d, det_idx):
+        """將點雲與 PCA 計算出的 3D Bounding Box 畫成 3D 視圖並存檔"""
+        try:
+            # 只有在呼叫時才 import，避免影響全域載入速度
+            import matplotlib.pyplot as plt
+            from mpl_toolkits.mplot3d import Axes3D
+        except ImportError:
+            print("   ⚠️ 缺少 matplotlib，無法繪製 3D 點雲圖。請在終端機執行: pip install matplotlib")
+            return
+
+        print(f"      正在繪製 PCA 點雲與 3D BBox 視圖...")
+        fig = plt.figure(figsize=(10, 8))
+        ax = fig.add_subplot(111, projection='3d')
+
+        # 1. 畫出點雲 (進行簡單下採樣以加快繪圖速度，同時不失真)
+        step = max(1, len(points_3d) // 8000)  # 最多保留大約 8000 個點來畫
+        sub_points = points_3d[::step]
+        ax.scatter(sub_points[:, 0], sub_points[:, 1], sub_points[:, 2], 
+                   c='c', marker='.', s=2, alpha=0.3, label='Object Point Cloud')
+
+        # 2. 畫出 3D Bounding Box 的 12 條邊
+        corners = bbox_3d['corners']
+        edges = [
+            (0, 1), (0, 2), (0, 4), (1, 3), (1, 5),
+            (2, 3), (2, 6), (3, 7), (4, 5), (4, 6),
+            (5, 7), (6, 7)
+        ]
+        for idx, edge in enumerate(edges):
+            pt1 = corners[edge[0]]
+            pt2 = corners[edge[1]]
+            # 只在第一條邊加上圖例標籤，避免圖例重複
+            label = '3D BBox' if idx == 0 else ""
+            ax.plot([pt1[0], pt2[0]], [pt1[1], pt2[1]], [pt1[2], pt2[2]], 
+                    c='r', linewidth=2, label=label)
+
+        # 3. 畫出 PCA 主軸向量 (從質心出發)
+        centroid = np.mean(points_3d, axis=0)
+        axes = bbox_3d['rotation_matrix']
+        sizes = bbox_3d['size'] / 2  # 畫一半長度即可代表方向
+        colors = ['g', 'b', 'm']  # X, Y, Z 主成分顏色 (綠, 藍, 洋紅)
+        labels = ['PCA_1 (Main Axis)', 'PCA_2', 'PCA_3']
+        
+        for i in range(3):
+            vec = axes[i] * sizes[i]
+            # 使用 quiver 畫出帶有方向的箭頭
+            ax.quiver(centroid[0], centroid[1], centroid[2], 
+                      vec[0], vec[1], vec[2], 
+                      color=colors[i], arrow_length_ratio=0.15, linewidth=3, label=labels[i])
+
+        # 4. 設定視角與標籤
+        ax.set_xlabel('X (m)')
+        ax.set_ylabel('Y (m)')
+        ax.set_zlabel('Depth Z (m)')
+        ax.set_title(f'PCA 3D Bounding Box (Camera {self.camera_id} - Object {det_idx})')
+        ax.legend()
+        
+        # 5. 鎖定 XYZ 的顯示比例 (Aspect Ratio) 避免框變形
+        max_range = np.array([sub_points[:, 0].max() - sub_points[:, 0].min(), 
+                              sub_points[:, 1].max() - sub_points[:, 1].min(), 
+                              sub_points[:, 2].max() - sub_points[:, 2].min()]).max() / 2.0
+        mid_x = (sub_points[:, 0].max() + sub_points[:, 0].min()) * 0.5
+        mid_y = (sub_points[:, 1].max() + sub_points[:, 1].min()) * 0.5
+        mid_z = (sub_points[:, 2].max() + sub_points[:, 2].min()) * 0.5
+        ax.set_xlim(mid_x - max_range, mid_x + max_range)
+        ax.set_ylim(mid_y - max_range, mid_y + max_range)
+        ax.set_zlim(mid_z - max_range, mid_z + max_range)
+
+        # 視角調整：從稍微側上的角度俯視
+        ax.view_init(elev=20, azim=-45)
+
+        # 存檔並釋放記憶體
+        save_path = os.path.join(self.output_dir, f"step4_pca_pointcloud_bbox_{det_idx}.png")
+        plt.savefig(save_path, dpi=200, bbox_inches='tight')
+        plt.close(fig)  # 非常重要：防止在迴圈中發生 Memory Leak
+        print(f"      📸 已儲存 PCA 點雲與 BBox 3D 視圖: {save_path}")
+
+
     def compute_3d_bounding_box(self, points_3d):
         """使用 PCA 計算 3D Bounding Box"""
         if len(points_3d) < 10:
@@ -563,6 +641,7 @@ class CameraDetector:
         
         if window_sizes is None:
             window_sizes = [(100, 100), (120, 120), (180, 180)]
+            
             # window_sizes = [(200,200), (250,250), (300,300)]
             # window_sizes = [(h, w), (180,180)]
             # window_sizes = [
@@ -691,7 +770,7 @@ class CameraDetector:
         
         return bbox_3d_object, object_mask, self.points_3d_object, crop_image
     
-    def _detect_handle_region(self, image_source, crop_image, x1, y1, x2, y2, 
+    def _detect_handle_region_old(self, image_source, crop_image, x1, y1, x2, y2, 
                              bbox_3d_object, object_mask, points_3d_object, det_idx):
         """第四步：搜索握柄區域"""
         print(f"      第二階段：CLIP 滑動窗口搜索握柄...")
@@ -758,7 +837,303 @@ class CameraDetector:
             'points_3d': points_3d_object,
             'region_type': 'object'
         }
+    def _detect_handle_region(self, image_source, crop_image, x1, y1, x2, y2, 
+                             bbox_3d_object, object_mask, points_3d_object, det_idx):
+        """第四步：搜索握柄區域"""
+        print(f"      第二階段：CLIP 滑動窗口搜索握柄...")
+        
+        handle_result = self.find_handle_by_sliding_window(crop_image, step_size=10)
+        use_handle = False
+        
+        if handle_result is not None:
+            handle_x1_crop, handle_y1_crop, handle_x2_crop, handle_y2_crop = handle_result['bbox']
+            similarity_score = handle_result['similarity']
+            
+            handle_x1 = x1 + handle_x1_crop
+            handle_y1 = y1 + handle_y1_crop
+            handle_x2 = x1 + handle_x2_crop
+            handle_y2 = y1 + handle_y2_crop
+            
+            print(f"      ✓ 找到握柄區域: ({handle_x1}, {handle_y1}) -> ({handle_x2}, {handle_y2})")
+            print(f"      握柄 CLIP 相似度: {similarity_score:.3f}")
+
+            # ==========================================
+            # 🌟 視覺化 A: 繪製 CLIP 滑動窗口找到的「最佳握柄候選框」
+            # ==========================================
+            vis_handle_box = image_source.copy()
+            # 畫出整體物品的框 (藍色)
+            cv2.rectangle(vis_handle_box, (x1, y1), (x2, y2), (255, 0, 0), 2)
+            cv2.putText(vis_handle_box, "Object", (x1, y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 0, 0), 2)
+            # 畫出 CLIP 找到的握柄框 (紅色)
+            cv2.rectangle(vis_handle_box, (handle_x1, handle_y1), (handle_x2, handle_y2), (0, 0, 255), 3)
+            cv2.putText(vis_handle_box, f"Handle Sim: {similarity_score:.2f}", (handle_x1, handle_y1 - 10), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 255), 2)
+            
+            box_save_path = os.path.join(self.output_dir, f"handle_step1_clip_box_{det_idx}.jpg")
+            cv2.imwrite(box_save_path, cv2.cvtColor(vis_handle_box, cv2.COLOR_RGB2BGR))
+            print(f"      📸 已儲存 CLIP 握柄搜尋框: {box_save_path}")
+
+            with torch.no_grad():
+                masks_handle, _, _ = self.predictor.predict(
+                    box=np.array([handle_x1, handle_y1, handle_x2, handle_y2]),
+                    multimask_output=False
+                )
+            handle_mask = masks_handle[0].astype(np.uint8) * 255
+            del masks_handle
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # ==========================================
+            # 🌟 視覺化 B: 對比「整體物品 Mask」與「握柄 Mask」
+            # ==========================================
+            vis_handle_mask = image_source.copy()
+            
+            # 疊加整體物品的 Mask (半透明藍色，作為背景對比)
+            colored_obj = np.zeros_like(vis_handle_mask)
+            colored_obj[object_mask > 0] = (255, 0, 0)
+            vis_handle_mask = cv2.addWeighted(vis_handle_mask, 0.7, colored_obj, 0.3, 0)
+            
+            # 疊加握柄的 Mask (半透明紅色，權重調高突顯)
+            colored_handle = np.zeros_like(vis_handle_mask)
+            colored_handle[handle_mask > 0] = (0, 0, 255)
+            vis_handle_mask = cv2.addWeighted(vis_handle_mask, 1.0, colored_handle, 0.6, 0)
+
+            # 加上外框輔助觀看
+            cv2.rectangle(vis_handle_mask, (handle_x1, handle_y1), (handle_x2, handle_y2), (0, 0, 255), 2)
+
+            mask_save_path = os.path.join(self.output_dir, f"handle_step2_sam_mask_{det_idx}.jpg")
+            cv2.imwrite(mask_save_path, cv2.cvtColor(vis_handle_mask, cv2.COLOR_RGB2BGR))
+            print(f"      📸 已儲存 握柄分割 Mask 對比圖: {mask_save_path}")
+
+            # 保留原本儲存純黑白 mask 的功能
+            handle_mask_path = os.path.join(
+                self.output_dir, f"mask_handle_final_{det_idx}.jpg"
+            )
+            cv2.imwrite(handle_mask_path, handle_mask)
+            
+            handle_points_3d = self.depth_to_point_cloud(
+                self.depth_image, handle_mask
+            )
+            
+            if len(handle_points_3d) >= 10:
+                handle_bbox_3d = self.compute_3d_bounding_box(handle_points_3d)
+                
+                if handle_bbox_3d is not None:
+                    print(f"      ✓ 握柄 3D bbox 計算成功 ({len(handle_points_3d)} 個點)")
+                    use_handle = True
+                    
+                    # 💡 隱藏版視覺化：如果你也想單獨看「握柄的 3D PCA 點雲圖」
+                    # 你可以直接在這裡呼叫上一動寫好的 _save_pca_point_cloud_vis
+                    # self._save_pca_point_cloud_vis(handle_points_3d, handle_bbox_3d, f"{det_idx}_handle_only")
+                    
+                    return {
+                        'bbox_3d': handle_bbox_3d,
+                        'mask': handle_mask,
+                        'bbox_2d': (handle_x1, handle_y1, handle_x2, handle_y2),
+                        'points_3d': handle_points_3d,
+                        'region_type': 'handle'
+                    }
+                else:
+                    print(f"      ⚠️  無法計算握柄 3D bbox，改用整個物體")
+            else:
+                print(f"      ⚠️  握柄點雲不足，改用整個物體")
+        else:
+            print(f"      ⚠️  CLIP 搜索未找到握柄，改用整個物體")
+        
+        # 回退到整體物體
+        print(f"      使用整個物體 3D bounding box")
+        return {
+            'bbox_3d': bbox_3d_object,
+            'mask': object_mask,
+            'bbox_2d': (x1, y1, x2, y2),
+            'points_3d': points_3d_object,
+            'region_type': 'object'
+        }
+    def find_handle_by_sliding_window_old(self, object_crop, step_size=20, window_sizes=None, det_idx=0):
+        """滑動窗口搜索握柄 (包含 Heatmap 視覺化)"""
+        if self.handle_reference_features is None:
+            print("    ⚠️  沒有載入握柄參考特徵")
+            return None
+        h, w = object_crop.shape[:2]
+        
+        if window_sizes is None:
+            window_sizes = [(100, 100), (120, 120), (180, 180)]
+            
+        best_similarity = 0.0
+        best_bbox = None
+        best_size = None
+        
+        # 🌟 新增：準備一張用來記錄分數的 Heatmap 畫布
+        heatmap_scores = np.zeros((h, w), dtype=np.float32)
+        
+        print(f"    滑動窗口搜索握柄 ({h}x{w})...")
+        
+        for win_h, win_w in window_sizes:
+            if win_h >= h or win_w >= w:
+                continue
+            
+            # 滑動窗口
+            for y in range(0, h - win_h, step_size):
+                for x in range(0, w - win_w, step_size):
+                    # 提取窗口
+                    window_crop = object_crop[y:y+win_h, x:x+win_w].copy()
+                    
+                    # 計算相似度
+                    similarity = self.compute_handle_similarity(window_crop)
+                    
+                    # 🌟 新增：將相似度分數記錄到 Heatmap 畫布對應的區域中
+                    # 若多個窗口重疊，我們保留該像素位置的最高分 (np.maximum)
+                    heatmap_scores[y:y+win_h, x:x+win_w] = np.maximum(
+                        heatmap_scores[y:y+win_h, x:x+win_w], similarity
+                    )
+                    
+                    # 更新最佳
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_bbox = (x, y, x + win_w, y + win_h)
+                        best_size = (win_w, win_h)
+                        
+            print(f"      窗口 ({win_h}x{win_w}) 掃描完成")
+        
+        print(f"    窗口大小: {best_size}, 最佳相似度: {best_similarity:.3f}")
+        
+        # ==========================================
+        # 🌟 視覺化：繪製並儲存 CLIP 相似度 Heatmap
+        # ==========================================
+        # 設定分數的上下限來強化視覺對比 (例如低於 0.15 當作 0)
+        min_score_thresh = 0.15
+        max_score = max(best_similarity, 0.001) # 避免除以 0
+        
+        # 將分數正規化到 0 ~ 1 之間
+        norm_scores = np.clip((heatmap_scores - min_score_thresh) / (max_score - min_score_thresh), 0, 1)
+        
+        # 轉成 0 ~ 255 的 uint8 格式
+        heatmap_img = np.uint8(255 * norm_scores)
+        
+        # 套用 OpenCV 的 JET 偽色彩 (藍色低分，紅色高分)
+        heatmap_color = cv2.applyColorMap(heatmap_img, cv2.COLORMAP_JET)
+        
+        # 將熱力圖與原圖 (object_crop) 疊加 (各佔 50% 權重)
+        vis_heatmap = cv2.addWeighted(object_crop, 0.6, heatmap_color, 0.4, 0)
+        
+        if best_similarity > 0.35 and best_bbox is not None:
+            print(f"    ✓ 找到握柄 (相似度: {best_similarity:.3f}, 尺寸: {best_size})")
+            
+            # 在 Heatmap 上畫出最終選定的最佳 Bounding Box (綠色)
+            bx1, by1, bx2, by2 = best_bbox
+            cv2.rectangle(vis_heatmap, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+            cv2.putText(vis_heatmap, f"Best Sim: {best_similarity:.2f}", (bx1, max(15, by1 - 5)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # 存檔
+            save_path = os.path.join(self.output_dir, f"sliding_window_heatmap_{det_idx}.jpg")
+            cv2.imwrite(save_path, vis_heatmap)
+            print(f"      📸 已儲存 CLIP 熱力圖: {save_path}")
+            
+            return {
+                'bbox': best_bbox,
+                'similarity': best_similarity,
+                'size': best_size
+            }
+        else:
+            print(f"    ❌ 握柄搜索失敗 (最佳相似度: {best_similarity:.3f})")
+            # 即使失敗也把 Heatmap 存下來，方便分析為何失敗
+            save_path = os.path.join(self.output_dir, f"sliding_window_heatmap_failed_{det_idx}.jpg")
+            cv2.imwrite(save_path, vis_heatmap)
+            return None
     
+    
+    def find_handle_by_sliding_window(self, object_crop, step_size=20, window_sizes=None, det_idx=0):
+        """滑動窗口搜索握柄 (包含 Heatmap 視覺化)"""
+        if self.handle_reference_features is None:
+            print("    ⚠️  沒有載入握柄參考特徵")
+            return None
+        h, w = object_crop.shape[:2]
+        
+        if window_sizes is None:
+            window_sizes = [(100, 100), (120, 120), (180, 180)]
+            
+        best_similarity = 0.0
+        best_bbox = None
+        best_size = None
+        
+        # 🌟 新增：準備一張用來記錄分數的 Heatmap 畫布
+        heatmap_scores = np.zeros((h, w), dtype=np.float32)
+        
+        print(f"    滑動窗口搜索握柄 ({h}x{w})...")
+        
+        for win_h, win_w in window_sizes:
+            if win_h >= h or win_w >= w:
+                continue
+            
+            # 滑動窗口
+            for y in range(0, h - win_h, step_size):
+                for x in range(0, w - win_w, step_size):
+                    # 提取窗口
+                    window_crop = object_crop[y:y+win_h, x:x+win_w].copy()
+                    
+                    # 計算相似度
+                    similarity = self.compute_handle_similarity(window_crop)
+                    
+                    # 🌟 新增：將相似度分數記錄到 Heatmap 畫布對應的區域中
+                    # 若多個窗口重疊，我們保留該像素位置的最高分 (np.maximum)
+                    heatmap_scores[y:y+win_h, x:x+win_w] = np.maximum(
+                        heatmap_scores[y:y+win_h, x:x+win_w], similarity
+                    )
+                    
+                    # 更新最佳
+                    if similarity > best_similarity:
+                        best_similarity = similarity
+                        best_bbox = (x, y, x + win_w, y + win_h)
+                        best_size = (win_w, win_h)
+                        
+            print(f"      窗口 ({win_h}x{win_w}) 掃描完成")
+        
+        print(f"    窗口大小: {best_size}, 最佳相似度: {best_similarity:.3f}")
+        
+        # ==========================================
+        # 🌟 視覺化：繪製並儲存 CLIP 相似度 Heatmap
+        # ==========================================
+        # 設定分數的上下限來強化視覺對比 (例如低於 0.15 當作 0)
+        min_score_thresh = 0.15
+        max_score = max(best_similarity, 0.001) # 避免除以 0
+        
+        # 將分數正規化到 0 ~ 1 之間
+        norm_scores = np.clip((heatmap_scores - min_score_thresh) / (max_score - min_score_thresh), 0, 1)
+        
+        # 轉成 0 ~ 255 的 uint8 格式
+        heatmap_img = np.uint8(255 * norm_scores)
+        
+        # 套用 OpenCV 的 JET 偽色彩 (藍色低分，紅色高分)
+        heatmap_color = cv2.applyColorMap(heatmap_img, cv2.COLORMAP_JET)
+        
+        # 將熱力圖與原圖 (object_crop) 疊加 (各佔 50% 權重)
+        vis_heatmap = cv2.addWeighted(object_crop, 0.6, heatmap_color, 0.4, 0)
+        
+        if best_similarity > 0.35 and best_bbox is not None:
+            print(f"    ✓ 找到握柄 (相似度: {best_similarity:.3f}, 尺寸: {best_size})")
+            
+            # 在 Heatmap 上畫出最終選定的最佳 Bounding Box (綠色)
+            bx1, by1, bx2, by2 = best_bbox
+            cv2.rectangle(vis_heatmap, (bx1, by1), (bx2, by2), (0, 255, 0), 2)
+            cv2.putText(vis_heatmap, f"Best Sim: {best_similarity:.2f}", (bx1, max(15, by1 - 5)), 
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 2)
+            
+            # 存檔
+            save_path = os.path.join(self.output_dir, f"sliding_window_heatmap_{det_idx}.jpg")
+            cv2.imwrite(save_path, vis_heatmap)
+            print(f"      📸 已儲存 CLIP 熱力圖: {save_path}")
+            
+            return {
+                'bbox': best_bbox,
+                'similarity': best_similarity,
+                'size': best_size
+            }
+        else:
+            print(f"    ❌ 握柄搜索失敗 (最佳相似度: {best_similarity:.3f})")
+            # 即使失敗也把 Heatmap 存下來，方便分析為何失敗
+            save_path = os.path.join(self.output_dir, f"sliding_window_heatmap_failed_{det_idx}.jpg")
+            cv2.imwrite(save_path, vis_heatmap)
+            return None
     def _extract_3d_info(self, bbox_3d):
         """第五步：提取 3D 資訊"""
         corners = bbox_3d['corners']
@@ -785,6 +1160,7 @@ class CameraDetector:
     
     def _calculate_endpoints(self, bbox_3d, center_3d):
         """第六步：計算長邊兩端點"""
+        print(f"      計算 3D 端點")
         corners = bbox_3d['corners']
         size_3d = bbox_3d['size']
         axes = bbox_3d['rotation_matrix']
@@ -820,7 +1196,13 @@ class CameraDetector:
             
         left_endpoint_base = self.camera_to_ee_transform(left_endpoint_3d)
         right_endpoint_base = self.camera_to_ee_transform(right_endpoint_3d)
-        
+        print(f"left_endpoint_base: {left_endpoint_base}\n right_endpoint_base: {right_endpoint_base}")
+
+        if left_endpoint_base[1] < right_endpoint_base[1]:
+            print(f"  ⚠️ 發現 PCA 方向不一致，正在修正...")
+            left_endpoint_base, right_endpoint_base = right_endpoint_base, left_endpoint_base
+            left_endpoint_3d, right_endpoint_3d = right_endpoint_3d, left_endpoint_3d
+        print(f"left_endpoint_base: {left_endpoint_base}\n right_endpoint_base: {right_endpoint_base}")
         max_distance = np.linalg.norm(right_endpoint_3d - left_endpoint_3d)
         edge_direction = right_endpoint_3d - left_endpoint_3d
 
@@ -1138,7 +1520,7 @@ class CameraDetector:
             return True
 
     
-    def detect_objects_simple(self):
+    def detect_objects_simple_old(self):
         
         """對當前畫面進行物品偵測並計算3D資訊（簡化版：僅整體物體檢測）"""
         if self.latest_color_image is None:
@@ -1286,6 +1668,202 @@ class CameraDetector:
             self.clear_detection_data()
             return True
     
+
+    def detect_objects_simple(self):
+        
+        """對當前畫面進行物品偵測並計算3D資訊（簡化版：僅整體物體檢測）"""
+        if self.latest_color_image is None:
+            print(f"❌ 相機 {self.camera_id}: 沒有可用的影像進行偵測")
+            return False
+            
+        print(f"\n🔍 相機 {self.camera_id} 開始物品偵測（簡化版 - 最多 {self.max_objects} 個物品）...")
+        print(f"phase list: {self.candidate_phrases}")
+        
+        # 載入和準備影像
+        temp_image_path = f"/home/gairobots/camera/GroundingDINO/data/tmp/temp_detect_camera_{self.camera_id}.png"
+        cv2.imwrite(temp_image_path, self.latest_color_image)
+        image_source, image = load_image(temp_image_path)
+        
+        rgb_image = cv2.cvtColor(image_source, cv2.COLOR_BGR2RGB)
+
+        gc.collect()
+        torch.cuda.empty_cache()
+        with self._sam_lock:
+            self.predictor.set_image(rgb_image)
+        
+        # 第一步：初始偵測
+        with torch.no_grad():
+            all_detections = self._get_initial_detections(image_source, image)
+            
+        # ==========================================
+        # 🌟 視覺化 Step 1: 儲存初始的所有候選框 (過濾前)
+        # ==========================================
+        vis_step1 = image_source.copy()
+        for det in all_detections:
+            x1, y1, x2, y2 = det['bbox_2d']
+            # 使用橘色畫出所有初始框 (RGB 格式)
+            cv2.rectangle(vis_step1, (x1, y1), (x2, y2), (255, 165, 0), 2)
+            text = f"{det['confidence']:.2f}"
+            cv2.putText(vis_step1, text, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (255, 165, 0), 2)
+        step1_path = os.path.join(self.output_dir, "step1_initial_detections.jpg")
+        cv2.imwrite(step1_path, cv2.cvtColor(vis_step1, cv2.COLOR_RGB2BGR))
+        print(f"   📸 已儲存 Step 1 (初始偵測): {step1_path}")
+
+        if len(all_detections) == 0:
+            print(f"   ❌ 相機 {self.camera_id}: 未偵測到任何物品")
+            return False
+        
+        # 第二步：篩選
+        selected_detections = self._filter_detections(all_detections)
+        
+        # ==========================================
+        # 🌟 視覺化 Step 2: 儲存 NMS 篩選後的框 (過濾後)
+        # ==========================================
+        vis_step2 = image_source.copy()
+        for det in selected_detections:
+            x1, y1, x2, y2 = det['bbox_2d']
+            # 使用綠色畫出篩選後的保留框
+            cv2.rectangle(vis_step2, (x1, y1), (x2, y2), (0, 255, 0), 3)
+            text = f"{det['phrase']}: {det['confidence']:.2f}"
+            cv2.putText(vis_step2, text, (x1, max(15, y1 - 5)), cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 255, 0), 2)
+        step2_path = os.path.join(self.output_dir, "step2_filtered_detections.jpg")
+        cv2.imwrite(step2_path, cv2.cvtColor(vis_step2, cv2.COLOR_RGB2BGR))
+        print(f"   📸 已儲存 Step 2 (NMS 篩選後): {step2_path}")
+        
+        # 視覺化準備 (最終 3D 結果的底圖)
+        vis = image_source.copy()
+        random.seed(42)
+        any_detected = False
+        H, W = image_source.shape[:2]
+        
+        colors_list = [
+            (255, 0, 0), (0, 255, 0), (0, 0, 255), (255, 255, 0),
+            (255, 0, 255), (0, 255, 255), (128, 0, 128), (255, 128, 0),
+            (0, 128, 255), (128, 255, 0)
+        ]
+        
+        # 處理每個檢測
+        for det_idx, detection in enumerate(selected_detections):
+            x1, y1, x2, y2 = detection['bbox_2d']
+            logit = detection['logit']
+            phrase = detection['phrase']
+            color = colors_list[det_idx % len(colors_list)]
+            
+            print(f"\n   處理第 {det_idx + 1} 個物品: {phrase}，信心度: {logit:.2f}")
+            
+            # 簡化版：僅檢測整體物體（跳過握柄檢測）
+            print(f"      檢測整體物體 3D bbox...")
+            
+            # 使用 SAM 生成 mask
+            with torch.no_grad():
+                masks_obj, _, _ = self.predictor.predict(
+                    box=np.array([x1, y1, x2, y2]),
+                    multimask_output=False
+                )
+            object_mask = masks_obj[0].astype(np.uint8) * 255
+
+            del masks_obj
+            gc.collect()
+            torch.cuda.empty_cache()
+
+            # 儲存純黑白 Mask
+            mask_path = os.path.join(self.output_dir, f"mask_simple_bw_{det_idx}.jpg")
+            cv2.imwrite(mask_path, object_mask)
+
+            # ==========================================
+            # 🌟 視覺化 Step 3: 儲存 SAM Mask 半透明疊加圖
+            # ==========================================
+            vis_step3 = image_source.copy()
+            # 創建一個顏色遮罩
+            colored_mask = np.zeros_like(vis_step3)
+            colored_mask[object_mask > 0] = color
+            # 將遮罩與原圖進行 Alpha 融合 (0.6 原圖, 0.4 遮罩)
+            vis_step3 = cv2.addWeighted(vis_step3, 0.6, colored_mask, 0.4, 0)
+            # 把 BBox 也畫上去方便對照
+            cv2.rectangle(vis_step3, (x1, y1), (x2, y2), color, 2)
+            step3_path = os.path.join(self.output_dir, f"step3_mask_overlay_{det_idx}.jpg")
+            cv2.imwrite(step3_path, cv2.cvtColor(vis_step3, cv2.COLOR_RGB2BGR))
+            print(f"      📸 已儲存 Step 3 (Mask 疊加圖): {step3_path}")
+            
+            # 計算 3D bbox
+            points_3d = self.depth_to_point_cloud(
+                self.depth_image, object_mask
+            )
+            
+            if len(points_3d) < 10:
+                print(f"      ❌ 點雲不足，跳過")
+                del object_mask, points_3d
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+            
+            bbox_3d = self.compute_3d_bounding_box(points_3d)
+            
+            if bbox_3d is None:
+                print(f"      ❌ 無法計算 3D bbox，跳過")
+                del object_mask, points_3d
+                gc.collect()
+                torch.cuda.empty_cache()
+                continue
+            
+            print(f"      ✓ 3D bbox 計算成功 ({len(points_3d)} 個點)")
+            # ==========================================
+            # 🌟 視覺化 Step 4: 繪製並儲存 PCA 點雲與 3D BBox
+            # ==========================================
+            self._save_pca_point_cloud_vis(points_3d, bbox_3d, det_idx)
+            # 第五步：提取 3D 資訊
+            info_3d = self._extract_3d_info(bbox_3d)
+            
+            print(f"      提取 3D 資訊...")
+            print(f"      3D中心: ({info_3d['center_base'][0]:.3f}, {info_3d['center_base'][1]:.3f}, {info_3d['center_base'][2]:.3f}) mm")
+            print(f"      3D尺寸: ({info_3d['size_3d'][0]:.3f}, {info_3d['size_3d'][1]:.3f}, {info_3d['size_3d'][2]:.3f}) mm")
+            
+            # 第六步：計算端點
+            endpoints = self._calculate_endpoints(bbox_3d, info_3d['center_3d'])
+            
+            print(f"      左端點基座: ({endpoints['left_base'][0]:.3f}, {endpoints['left_base'][1]:.3f}, {endpoints['left_base'][2]:.3f}) mm")
+            print(f"      右端點基座: ({endpoints['right_base'][0]:.3f}, {endpoints['right_base'][1]:.3f}, {endpoints['right_base'][2]:.3f}) mm")
+            print(f"      長邊長度: {endpoints['distance']:.3f} m")
+            
+            # 第七步：CLIP 驗證
+            print(f"      CLIP 驗證...")
+            with torch.no_grad():
+                final_label = self._verify_with_clip(image_source, (x1, y1, x2, y2), object_mask)
+            
+            any_detected = True
+            
+            # 收集所有資訊（簡化版無 region_type 和握柄資訊）
+            detection_info = {
+                'bbox_3d': bbox_3d,
+                'bbox_2d': (x1, y1, x2, y2),
+                '3d_info': info_3d,
+                'endpoints': endpoints,
+                'region_type': 'object',  # 簡化版固定為 object
+                'final_label': final_label,
+                'logit': logit,
+                'points_3d': points_3d
+            }
+            
+            # 第八步：視覺化（簡化版輸出，累積到最終的 vis 畫布上）
+            vis = self._visualize_detection_simple(vis, detection_info, color, W, H, det_idx)
+            
+            # 第九步：儲存資訊（簡化版）
+            self._save_object_info_simple(detection_info)
+        
+        # 儲存最終 3D 結果
+        vis_bgr = cv2.cvtColor(vis, cv2.COLOR_RGB2BGR)
+        result_path = os.path.join(self.output_dir, "detection_3d_simple.jpg")
+        cv2.imwrite(result_path, vis_bgr)
+        
+        if not any_detected:
+            print(f"   ❌ 相機 {self.camera_id}: 未偵測到任何物品")
+            self.clear_detection_data()
+            return False
+        else:
+            print(f"\n   ✅ 相機 {self.camera_id}: 3D偵測最終結果已儲存: {result_path}")
+            print(f"   成功檢測到 {len(self.objects_info)} 個物品")
+            self.clear_detection_data()
+            return True
     def _visualize_detection_simple(self, vis, info, color, W, H, det_idx):
         """簡化版繪製檢測結果（無握柄資訊）"""
         bbox_3d = info['bbox_3d']

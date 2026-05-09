@@ -88,6 +88,8 @@ class SharedModels:
         tool_categories = {
             'brush tool': 'brush_handle_features.pt',
             'dustpan tool': 'dustpan_handle_features.pt',
+            'bottle cap': 'Bottle cap_handle_features.pt',
+            'sprinkler tool': 'sprinkler_handle_features.pt',
            
         }
         loaded_count = 0

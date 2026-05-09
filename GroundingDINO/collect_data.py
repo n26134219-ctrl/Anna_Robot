@@ -1449,10 +1449,12 @@ if __name__ == "__main__":
     #                                 ])
 
 
-    collect_demo_images(realsense_number="243222072706", num_demos=3, tool_name="brush")
+    collect_demo_images(realsense_number="243322074668", num_demos=3, tool_name="sprinkler")
     
 
     # 如果要檢測 3 個物品，可以改為：
     # objects = object_detection(max_objects=3)
+    # 243322074668:左手
+    # 243222072706:右手
 
 
